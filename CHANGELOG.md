@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.0.0]
+
+### Added
+- Forked SyncNon-SteamGames as SyncNon-SteamGamesPlus with Xbox Game Pass support.
+- Auto-detect Game Pass installs from `.GamingRoot`, `XboxGames`, and `Xbox Games` on every drive.
+- Launch Xbox Game Pass games through `gamelaunchhelper.exe` with the `Content` folder as Start In.
+- Optional extra Xbox Games folders, GUI/CLI scan toggle, and `Xbox Game Pass` Steam tags.
+- Plus-only shortcut ownership tag `SyncNon-SteamPlus` so original-tool shortcuts are left alone.
+- Settings stored in `%APPDATA%\SyncNonSteamGamesPlus\parameters.json`, with a one-time copy of the original app's Steam path, API key, and user ID.
+- Warning when Steam is running, because it can overwrite `shortcuts.vdf` on exit.
+- Xbox shortcuts use `StoreIcon` from the game `Content` folder (with `StoreLogo` as fallback).
+- Interactive SteamGridDB match confirmation, with saved per-game choices, so titles like Minecraft Bedrock can be corrected.
+- Optional automatic Steam restart (off on first launch) so shortcuts and collections reload.
+- Optional Steam library collection named `Xbox Game Pass` containing every imported Xbox game.
+
 ## [v1.6.0]
 
 ### Added

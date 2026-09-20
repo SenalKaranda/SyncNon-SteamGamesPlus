@@ -1,5 +1,5 @@
 import sys, os, re
-from typing import Tuple, Dict, Any
+from typing import Tuple
 
 import vdf
 import requests
@@ -7,10 +7,35 @@ import logging
 import zlib
 import json
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from urllib.parse import quote
 from gooey import Gooey, GooeyParser
 import traceback
+
+from game_entry import (
+    GameEntry,
+    OWNERSHIP_TAG,
+    SOURCE_FOLDER,
+    SOURCE_XBOX,
+    XBOX_TAG,
+    merge_game_entries,
+    normalize_path,
+    split_path_list,
+)
+from steamgrid_match import (
+    GridCandidate,
+    GridPick,
+    extract_candidates,
+    pick_best_candidate,
+    prompt_grid_match_cli,
+    prompt_grid_match_gui,
+    rank_candidates,
+    titles_look_similar,
+)
+from steam_collections import write_xbox_collection
+from xbox_games import discover_xbox_games
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
@@ -98,9 +123,21 @@ def patch_gooey_output_decoding():
 
 STEAM_ID64_BASE = 76561197960265728
 DEFAULT_STEAMDIR_PATH = r"C:\Program Files (x86)\Steam"
+ORIGINAL_APP_CONFIG_DIRNAME = "SyncNonSteamGames"
+PLUS_APP_CONFIG_DIRNAME = "SyncNonSteamGamesPlus"
 
-def normalize_path(p: str) -> str:
-    return os.path.normcase(os.path.normpath(p.strip('"')))
+
+def coerce_bool(value, default=True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
 
 
 def is_default_steamdir_path(path: str) -> bool:
@@ -155,18 +192,44 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_CONFIG_DIR = os.path.join(os.environ.get("APPDATA", BASE_DIR), "SyncNonSteamGames")
+APP_CONFIG_DIR = os.path.join(os.environ.get("APPDATA", BASE_DIR), PLUS_APP_CONFIG_DIRNAME)
+ORIGINAL_APP_CONFIG_DIR = os.path.join(os.environ.get("APPDATA", BASE_DIR), ORIGINAL_APP_CONFIG_DIRNAME)
 CONFIG_JSON_FILENAME = "parameters.json"
+
+
+def migrate_settings_from_original(app_config_path):
+    if os.path.isfile(app_config_path):
+        return
+
+    original_config_path = os.path.join(ORIGINAL_APP_CONFIG_DIR, CONFIG_JSON_FILENAME)
+    if not os.path.isfile(original_config_path):
+        return
+
+    original = readJsonFile(original_config_path) or {}
+    migrated = {
+        "game_installation_path": original.get("game_installation_path", ""),
+        "steamgriddb_api_key": original.get("steamgriddb_api_key", ""),
+        "steamdir_path": original.get("steamdir_path", ""),
+        "steam_user_id": original.get("steam_user_id", ""),
+        "scan_xbox": True,
+        "xbox_games_path": "",
+        "confirm_matches": True,
+        "restart_steam": False,
+        "xbox_collection": True,
+    }
+    saveJsonFile(app_config_path, migrated)
+    logger.info(f"Migrated Steam settings from {original_config_path}")
 
 
 def get_stored_parameters_json_filename():
     os.makedirs(APP_CONFIG_DIR, exist_ok=True)
     app_config_path = os.path.join(APP_CONFIG_DIR, CONFIG_JSON_FILENAME)
     legacy_config_path = os.path.join(BASE_DIR, CONFIG_JSON_FILENAME)
-    if os.path.isfile(legacy_config_path):
+    if os.path.isfile(legacy_config_path) and not os.path.isfile(app_config_path):
         shutil.copy2(legacy_config_path, app_config_path)
         os.remove(legacy_config_path)
 
+    migrate_settings_from_original(app_config_path)
     return app_config_path
 
 
@@ -174,42 +237,198 @@ storedParametersJSONFilename = get_stored_parameters_json_filename()
 logger.info(f"Using parameters file: {storedParametersJSONFilename}")
 
 storedParametersJSON = {}
-storedParametersJSON = readJsonFile(storedParametersJSONFilename)
+storedParametersJSON = readJsonFile(storedParametersJSONFilename) or {}
 
 game_installation_path = ""
 steamgriddb_api_key = ""
 steamdir_path = ""
 steam_user_id = ""
+scan_xbox = True
+xbox_games_path = ""
+confirm_matches = True
+restart_steam = False
+xbox_collection = True
+grid_overrides = {}
+xbox_collection_appids = []
 
 ##Taking them from the JSON if it exists
 if storedParametersJSON:
-    game_installation_path = storedParametersJSON["game_installation_path"]
-    steamgriddb_api_key = storedParametersJSON["steamgriddb_api_key"]
-    steamdir_path = storedParametersJSON["steamdir_path"]
+    game_installation_path = storedParametersJSON.get("game_installation_path", "")
+    steamgriddb_api_key = storedParametersJSON.get("steamgriddb_api_key", "")
+    steamdir_path = storedParametersJSON.get("steamdir_path", "")
+    steam_user_id = storedParametersJSON.get("steam_user_id", "")
+    scan_xbox = coerce_bool(storedParametersJSON.get("scan_xbox", True), True)
+    xbox_games_path = storedParametersJSON.get("xbox_games_path", "")
+    confirm_matches = coerce_bool(storedParametersJSON.get("confirm_matches", True), True)
+    restart_steam = coerce_bool(storedParametersJSON.get("restart_steam", False), False)
+    xbox_collection = coerce_bool(storedParametersJSON.get("xbox_collection", True), True)
+    grid_overrides = storedParametersJSON.get("grid_overrides", {}) or {}
+    xbox_collection_appids = storedParametersJSON.get("xbox_collection_appids", []) or []
     if "steam_user_id" not in storedParametersJSON:
         storedParametersJSON["steam_user_id"] = ""
         saveJsonFile(storedParametersJSONFilename, storedParametersJSON)
-    steam_user_id = storedParametersJSON["steam_user_id"]
 
 totalGames = 0
 currentGame = 0
+review_uses_gui = True
 
 
-def read_current_games():
-    """Read the current games from the game installation directory."""
+def is_steam_running() -> bool:
     try:
-        current_games = {os.path.join(base_path, subfolder)
-                         for base_path in game_installation_path.split(";")
-                         if os.path.isdir(base_path)
-                         for subfolder in os.listdir(base_path)
-                         if os.path.isdir(os.path.join(base_path, subfolder))}
-        global totalGames
-        totalGames = len(current_games)
-        logger.info(f"Total number of games: {totalGames}")
+        import psutil
+    except ImportError:
+        return False
+    try:
+        for process in psutil.process_iter(["name"]):
+            if (process.info.get("name") or "").lower() == "steam.exe":
+                return True
+    except Exception:
+        return False
+    return False
 
+
+def warn_if_steam_running():
+    if is_steam_running():
+        logger.warning(
+            "Steam is running. Steam may overwrite shortcuts.vdf when it exits. Restart Steam after this sync, or enable Restart Steam automatically."
+        )
+
+
+def stop_steam(timeout_seconds: float = 30.0) -> bool:
+    steam_exe = os.path.join(steamdir_path, "steam.exe")
+    if os.path.isfile(steam_exe):
+        try:
+            subprocess.run([steam_exe, "-shutdown"], check=False, timeout=10)
+        except Exception as exc:
+            logger.warning(f"Could not ask Steam to shut down cleanly: {exc}")
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not is_steam_running():
+            logger.info("Steam has shut down.")
+            return True
+        time.sleep(0.5)
+
+    try:
+        import psutil
+        for process in list(psutil.process_iter(["name"])):
+            if (process.info.get("name") or "").lower() == "steam.exe":
+                process.terminate()
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if not is_steam_running():
+                logger.info("Steam was terminated.")
+                return True
+            time.sleep(0.4)
+    except Exception as exc:
+        logger.warning(f"Could not terminate Steam: {exc}")
+    logger.error("Steam is still running.")
+    return False
+
+
+def start_steam():
+    steam_exe = os.path.join(steamdir_path, "steam.exe")
+    if not os.path.isfile(steam_exe):
+        logger.error(f"Steam executable not found at {steam_exe}")
+        return
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen(
+            [steam_exe],
+            cwd=steamdir_path,
+            close_fds=True,
+            creationflags=flags,
+        )
+        logger.info("Started Steam.")
+    except Exception as exc:
+        logger.error(f"Could not start Steam: {exc}")
+
+
+def collect_xbox_appids(shortcuts) -> list[int]:
+    appids = []
+    for shortcut in (shortcuts or {}).get("shortcuts", {}).values():
+        if not is_plus_shortcut(shortcut):
+            continue
+        if XBOX_TAG not in shortcut_tags(shortcut):
+            continue
+        try:
+            appids.append(int(normalize_appid(shortcut["appid"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return appids
+
+
+def save_xbox_collection_appids(appids):
+    global xbox_collection_appids
+    data = readJsonFile(storedParametersJSONFilename) or {}
+    xbox_collection_appids = [int(value) for value in appids]
+    data["xbox_collection_appids"] = xbox_collection_appids
+    saveJsonFile(storedParametersJSONFilename, data)
+
+
+def shortcut_tags(shortcut) -> list[str]:
+    tags = shortcut.get("tags") or {}
+    if isinstance(tags, dict):
+        return [str(value) for value in tags.values()]
+    if isinstance(tags, list):
+        return [str(value) for value in tags]
+    return []
+
+
+def is_plus_shortcut(shortcut) -> bool:
+    return OWNERSHIP_TAG in shortcut_tags(shortcut)
+
+
+def build_shortcut_tags(source: str) -> dict[str, str]:
+    tags = {"0": OWNERSHIP_TAG}
+    if source == SOURCE_XBOX:
+        tags["1"] = XBOX_TAG
+    return tags
+
+
+def read_folder_games() -> list[GameEntry]:
+    entries: list[GameEntry] = []
+    if not game_installation_path:
+        return entries
+
+    try:
+        for base_path in split_path_list(game_installation_path):
+            if not os.path.isdir(base_path):
+                continue
+            for subfolder in os.listdir(base_path):
+                game_dir = os.path.join(base_path, subfolder)
+                if not os.path.isdir(game_dir):
+                    continue
+                exe_file = find_largest_exe(game_dir)
+                entries.append(
+                    GameEntry(
+                        name=subfolder,
+                        search_name=subfolder,
+                        exe_path=exe_file or "",
+                        start_dir=game_dir,
+                        source=SOURCE_FOLDER,
+                    )
+                )
     except Exception as e:
         logger.error(f"Error reading game installation directory {game_installation_path}: {e}")
-        return set()
+        return []
+    return entries
+
+
+def read_current_games() -> list[GameEntry]:
+    """Read games from configured folders and optional Xbox Game Pass installs."""
+    xbox_entries: list[GameEntry] = []
+    if scan_xbox:
+        logger.info("Scanning Xbox Game Pass installs...")
+        xbox_entries = discover_xbox_games(extra_roots=xbox_games_path)
+        logger.info(f"Xbox Game Pass games found: {len(xbox_entries)}")
+
+    folder_entries = read_folder_games()
+    current_games = merge_game_entries(xbox_entries, folder_entries)
+
+    global totalGames
+    totalGames = len(current_games)
+    logger.info(f"Total number of games: {totalGames}")
     return current_games
 
 
@@ -326,25 +545,111 @@ def send_steam_grid_db_request(exe_name: str):
     logger.info(f"Searching SteamGridDB for {exe_name}, URL: {search_url}, Status Code: {response.status_code}")
     return response
 
-def extract_result_tuple_from_data(data) -> tuple[str, str] | tuple[None, None]:
-    if data['success'] and data['data']:
-        game_id = data['data'][0]['id']  # Assuming first result is the best match
-        game_name = data['data'][0]['name']
-        return game_id, game_name
-    return None,None
+def search_steam_grid_candidates(query: str) -> list[GridCandidate]:
+    if not query:
+        return []
+    response = send_steam_grid_db_request(query)
+    if response.status_code != 200:
+        return []
+    try:
+        payload = response.json()
+    except ValueError:
+        return []
+    return rank_candidates(query, extract_candidates(payload))
 
 
 def retrieve_steam_grid_data(exe_name: str) -> Tuple[str, str]:
-    game_id = None
-    game_name = None
+    best = pick_best_candidate(exe_name, search_steam_grid_candidates(exe_name))
+    if not best:
+        return None, None
+    logger.info(best.game_name)
+    return best.game_id, best.game_name
 
-    response = send_steam_grid_db_request(exe_name)
-    if response.status_code == 200:
-        data = response.json()
-        (game_id, game_name) = extract_result_tuple_from_data(data)
-        logger.info(game_name)
 
-    return game_id, game_name
+def quoted_shortcut_path(path: str) -> str:
+    return f'"{path}"' if path else ""
+
+
+def shortcut_icon_path(shortcut) -> str:
+    return normalize_path(shortcut.get("icon", ""))
+
+
+def load_grid_override(start_dir: str) -> GridCandidate | None:
+    override = (grid_overrides or {}).get(normalize_path(start_dir))
+    if not isinstance(override, dict):
+        return None
+    game_id = str(override.get("game_id") or "").strip() or None
+    game_name = str(override.get("game_name") or "").strip() or None
+    if not game_name:
+        return None
+    return GridCandidate(game_id=game_id or "", game_name=game_name)
+
+
+def save_grid_override(start_dir: str, game_id: str | None, game_name: str):
+    global grid_overrides
+    data = readJsonFile(storedParametersJSONFilename) or {}
+    overrides = data.get("grid_overrides") or {}
+    overrides[normalize_path(start_dir)] = {
+        "game_id": str(game_id or ""),
+        "game_name": game_name,
+    }
+    data["grid_overrides"] = overrides
+    grid_overrides = overrides
+    saveJsonFile(storedParametersJSONFilename, data)
+
+
+def should_review_match(entry: GameEntry, existing_appname: str | None) -> bool:
+    if not confirm_matches:
+        return False
+    if load_grid_override(entry.start_dir):
+        return False
+    if existing_appname and titles_look_similar(entry.search_name or entry.name, existing_appname):
+        return False
+    return True
+
+
+def resolve_grid_match(entry: GameEntry, existing_appname: str | None, use_gui: bool) -> GridPick | None:
+    query = entry.search_name or entry.name
+    override = load_grid_override(entry.start_dir)
+    if override:
+        logger.info(f"Using saved SteamGridDB match: {override.game_name}")
+        return GridPick(game_id=override.game_id or None, game_name=override.game_name)
+
+    candidates = search_steam_grid_candidates(query)
+    if not candidates:
+        split_name = camel_case_to_split_name(query)
+        if split_name != query:
+            candidates = search_steam_grid_candidates(split_name)
+
+    if not should_review_match(entry, existing_appname):
+        best = pick_best_candidate(query, candidates)
+        if best:
+            return GridPick(game_id=best.game_id, game_name=best.game_name)
+        if existing_appname:
+            return None
+        return GridPick(skip=True)
+
+    logger.info(f"Waiting for SteamGridDB match confirmation for {query}")
+    prompt_fn = prompt_grid_match_gui if use_gui else prompt_grid_match_cli
+    try:
+        pick = prompt_fn(
+            discovered_name=query,
+            folder_name=entry.name,
+            current_appname=existing_appname,
+            candidates=candidates,
+            search_fn=search_steam_grid_candidates,
+        )
+    except Exception:
+        logger.error("Interactive SteamGridDB prompt failed; using the suggested match.")
+        logger.error(traceback.format_exc())
+        best = pick_best_candidate(query, candidates)
+        if not best:
+            return GridPick(skip=True)
+        pick = GridPick(game_id=best.game_id, game_name=best.game_name)
+
+    if not pick.skip and pick.game_name:
+        save_grid_override(entry.start_dir, pick.game_id, pick.game_name)
+    return pick
 
 
 def update_shortcuts(current_games, steam_user_data_path):
@@ -364,19 +669,15 @@ def update_shortcuts(current_games, steam_user_data_path):
             with open(shortcuts_file, 'rb') as shortcuts_vdf:
                 shortcuts = vdf.binary_load(shortcuts_vdf)
 
-        # Collect the current shortcuts
-        existing_games = {os.path.basename(shortcut.get('StartDir', '').lower().strip('"')): shortcut for shortcut in
-                          shortcuts['shortcuts'].values()}
-
-        current_games_norm = {normalize_path(p) for p in current_games}
+        current_games_norm = {entry.normalized_start_dir() for entry in current_games}
 
         # Remove shortcuts for games no longer in the installation directory
-        for game_name, params_json in existing_games.items():
-            shortcut_path_norm = normalize_path(params_json["StartDir"])
-            game_sync_tag = params_json["tags"].get("0", "")
-            if shortcut_path_norm not in current_games_norm and game_name != "" and game_sync_tag == "SyncNon-Steam":
+        for idx, params_json in list(shortcuts.get('shortcuts', {}).items()):
+            shortcut_path_norm = normalize_path(params_json.get("StartDir", ""))
+            game_label = params_json.get("appname") or os.path.basename(shortcut_path_norm)
+            if shortcut_path_norm not in current_games_norm and shortcut_path_norm and is_plus_shortcut(params_json):
                 logger.info(
-                    f"Game {game_name} from path: {shortcut_path_norm} is on steam but not in the installation directory, removing it from shortcuts")
+                    f"Game {game_label} from path: {shortcut_path_norm} is on steam but not in the installation directory, removing it from shortcuts")
                 appid = normalize_appid(params_json["appid"])
                 # Remove images associated with the game
                 for image_type in ['p', '_hero', '_logo', 'home']:
@@ -387,25 +688,28 @@ def update_shortcuts(current_games, steam_user_data_path):
                             image_path = os.path.join(grid_folder, f'{appid}{image_type}{ext}')
                         if os.path.exists(image_path):
                             os.remove(image_path)
-                            logger.info(f"Removed {image_type} image for game: {game_name}")
+                            logger.info(f"Removed {image_type} image for game: {game_label}")
 
-                # Remove the shortcut from shortcuts file
-                for idx, s in list(shortcuts['shortcuts'].items()):
-                    if normalize_path(s.get('StartDir', '')) == shortcut_path_norm:
-                        del shortcuts['shortcuts'][idx]
-                        logger.info(f"Removed shortcut for game: {game_name}")
-                # Reindex shortcuts to sequential numeric keys
-                shortcuts['shortcuts'] = {
-                    str(i): v for i, v in enumerate(shortcuts['shortcuts'].values())
-                }
+                del shortcuts['shortcuts'][idx]
+                logger.info(f"Removed shortcut for game: {game_label}")
+
+        # Reindex shortcuts to sequential numeric keys
+        shortcuts['shortcuts'] = {
+            str(i): v for i, v in enumerate(shortcuts.get('shortcuts', {}).values())
+        }
+
+        existing_by_start_dir = {
+            normalize_path(shortcut.get('StartDir', '')): shortcut
+            for shortcut in shortcuts['shortcuts'].values()
+        }
+
+        global confirm_matches
+        confirm_for_run = confirm_matches
 
         # Add or update games in shortcuts
-        for game_path in current_games:
-            shortcut_already_present = False
-            appid = None
-            exe_path = None
+        for entry in current_games:
             try:
-                game_name = os.path.basename(game_path)
+                game_name = entry.search_name or entry.name
 
                 global currentGame
                 currentGame += 1
@@ -413,55 +717,91 @@ def update_shortcuts(current_games, steam_user_data_path):
                 logger.info(f"Current game: {game_name}")
                 logger.info(f"Games processed: {currentGame}/{totalGames}")
 
-                for existing_game_name, params_json in existing_games.items():
-                    cur_game_path = params_json["StartDir"].strip('"')
-                    if normalize_path(game_path) == normalize_path(cur_game_path):
-                        shortcut_already_present = True
-                        logger.info(f"{game_name} already in Steam")
-                        # normalization necessary or the appid gets incorrectly treated as signed int
-                        appid = normalize_appid(params_json["appid"])
-                        break
+                matching_shortcut = existing_by_start_dir.get(entry.normalized_start_dir())
+                existing_appname = matching_shortcut.get("appname") if matching_shortcut else None
+                confirm_matches = confirm_for_run
+                if matching_shortcut:
+                    logger.info(f"{game_name} already in Steam as {existing_appname}")
+                    if entry.icon_path and shortcut_icon_path(matching_shortcut) != normalize_path(entry.icon_path):
+                        matching_shortcut["icon"] = quoted_shortcut_path(entry.icon_path)
+                        logger.info(f"Updated shortcut icon for {game_name}: {entry.icon_path}")
+                    if not load_grid_override(entry.start_dir) and not should_review_match(entry, existing_appname):
+                        continue
 
-                if not shortcut_already_present:
-                    exe_file = find_largest_exe(game_path)
+                exe_file = entry.exe_path
+                if not exe_file and entry.source == SOURCE_FOLDER:
+                    exe_file = find_largest_exe(entry.start_dir)
+                if not matching_shortcut:
                     if exe_file:
-                        logger.info(f"Largest .exe file found: {exe_file}")
+                        logger.info(f"Using executable: {exe_file}")
                     else:
                         logger.error(f"No .exe files found for {game_name}. Skipping...")
                         continue
 
-                    exe_path = os.path.join(game_path, exe_file)
-                    appid = normalize_appid(generate_appid(game_name, exe_path))
+                pick = resolve_grid_match(entry, existing_appname, review_uses_gui)
+                if pick and pick.apply_to_rest:
+                    confirm_for_run = False
+                    confirm_matches = False
+                    logger.info("Auto-accepting suggested SteamGridDB matches for remaining games.")
 
-                    (game_id, steam_grid_game_name) = retrieve_steam_grid_data(game_name)
+                if pick and pick.skip:
+                    if matching_shortcut:
+                        logger.info(f"Keeping existing Steam shortcut for {game_name}")
+                    else:
+                        logger.info(f"Skipped {game_name}")
+                    continue
 
-                    if steam_grid_game_name is None:
-                        (game_id, steam_grid_game_name) = retrieve_steam_grid_data(camel_case_to_split_name(game_name))
-
-                    if steam_grid_game_name is None:
+                steam_grid_game_name = pick.game_name if pick else None
+                game_id = pick.game_id if pick else None
+                if not steam_grid_game_name:
+                    if matching_shortcut:
+                        steam_grid_game_name = existing_appname
+                    else:
+                        logger.error(f"No SteamGridDB match for {game_name}. Skipping...")
                         continue
 
+                icon_value = quoted_shortcut_path(entry.icon_path) if entry.icon_path else ""
+
+                if matching_shortcut:
+                    updated = False
+                    if steam_grid_game_name and matching_shortcut.get("appname") != steam_grid_game_name:
+                        matching_shortcut["appname"] = steam_grid_game_name
+                        updated = True
+                        logger.info(f"Updated Steam name for {game_name} to {steam_grid_game_name}")
+                    if entry.icon_path and shortcut_icon_path(matching_shortcut) != normalize_path(entry.icon_path):
+                        matching_shortcut["icon"] = icon_value
+                        updated = True
+                        logger.info(f"Updated shortcut icon for {game_name}: {entry.icon_path}")
+                    appid = normalize_appid(matching_shortcut["appid"])
+                    if game_id and updated:
+                        save_images(appid, game_id)
+                    elif entry.icon_path and updated:
+                        pass
+                    continue
+
+                exe_path = exe_file
+                appid = normalize_appid(generate_appid(game_name, exe_path))
+                if game_id:
                     save_images(appid, game_id)
 
-                    # Add shortcut entry
-                    new_entry = {
-                        "appid": appid,
-                        "appname": steam_grid_game_name,
-                        "exe": f'"{exe_path}"',
-                        "StartDir": f'"{game_path}"',
-                        "LaunchOptions": "",
-                        "IsHidden": 0,
-                        "AllowDesktopConfig": 1,
-                        "OpenVR": 0,
-                        "Devkit": 0,
-                        "DevkitGameID": "",
-                        "LastPlayTime": 0,
-                        "tags": {
-                            "0": "SyncNon-Steam"
-                        }
-                    }
-                    shortcuts['shortcuts'][str(len(shortcuts['shortcuts']))] = new_entry
-                    logger.info(f"Added shortcut for game: {game_name}")
+                new_entry = {
+                    "appid": appid,
+                    "appname": steam_grid_game_name,
+                    "exe": quoted_shortcut_path(exe_path),
+                    "StartDir": quoted_shortcut_path(entry.start_dir),
+                    "icon": icon_value,
+                    "LaunchOptions": "",
+                    "IsHidden": 0,
+                    "AllowDesktopConfig": 1,
+                    "OpenVR": 0,
+                    "Devkit": 0,
+                    "DevkitGameID": "",
+                    "LastPlayTime": 0,
+                    "tags": build_shortcut_tags(entry.source),
+                }
+                shortcuts['shortcuts'][str(len(shortcuts['shortcuts']))] = new_entry
+                existing_by_start_dir[entry.normalized_start_dir()] = new_entry
+                logger.info(f"Added shortcut for game: {game_name}")
 
             except Exception as e:
                 logger.error("Error updating shortcuts:")
@@ -471,11 +811,13 @@ def update_shortcuts(current_games, steam_user_data_path):
         with open(shortcuts_file, 'wb') as f:
             vdf.binary_dump(shortcuts, f)
             logger.info("Shortcuts file updated and saved.")
+        return collect_xbox_appids(shortcuts)
 
 
     except Exception as e:
         logger.error(f"Error updating shortcuts: {e}")
         logger.error(traceback.format_exc())
+        return []
 
 def steamid64_id_to_userdata_id(steamid64: str | int) -> str:
     return str(int(steamid64) - STEAM_ID64_BASE)
@@ -542,7 +884,7 @@ def resolve_steam_user_id(selected_steam_user_id, steam_users=None) -> str | Non
 
 
 def GUI(allow_raw_steam_user_id=False):
-    parser = GooeyParser(description='Get your NonSteam Games added on Steam.')
+    parser = GooeyParser(description='Add Non-Steam and Xbox Game Pass games to Steam.')
     selected_steamdir_path = steamdir_path or DEFAULT_STEAMDIR_PATH
     steam_users = get_steam_users(selected_steamdir_path)
     steam_user_id_choices = list(steam_users.values())
@@ -565,6 +907,7 @@ def GUI(allow_raw_steam_user_id=False):
         '--game_installation_path',
         widget='MultiDirChooser',
         metavar='NonSteam Games Folder',
+        help='Optional when Xbox Game Pass scanning is enabled. Use semicolons to list multiple folders.',
         action='store',
         default=game_installation_path if game_installation_path else ''
     )
@@ -597,22 +940,86 @@ def GUI(allow_raw_steam_user_id=False):
         action='store'
     )
 
+    xbox_group = parser.add_argument_group(
+        'Xbox Game Pass',
+        gooey_options={'show_border': True, 'columns': 1}
+    )
+    xbox_group.add_argument(
+        '--scan_xbox',
+        metavar='Scan Xbox Game Pass games',
+        help='Discover games from XboxGames folders on every drive and launch them with gamelaunchhelper.exe.',
+        widget='Dropdown',
+        choices=['yes', 'no'],
+        default='yes' if scan_xbox else 'no',
+        action='store'
+    )
+    xbox_group.add_argument(
+        '--xbox_games_path',
+        metavar='Extra Xbox Games folders',
+        widget='MultiDirChooser',
+        help='Optional extra XboxGames folders besides auto-detected drive roots.',
+        default=xbox_games_path if xbox_games_path else '',
+        action='store'
+    )
+    xbox_group.add_argument(
+        '--xbox_collection',
+        metavar='Xbox Game Pass collection',
+        help='Put every imported Xbox game into one Steam collection named Xbox Game Pass.',
+        widget='Dropdown',
+        choices=['yes', 'no'],
+        default='yes' if xbox_collection else 'no',
+        action='store'
+    )
+
+    parser.add_argument(
+        '--confirm_matches',
+        metavar='Confirm SteamGridDB matches',
+        help='Ask before adding each game so you can pick the right SteamGridDB title. Saved choices are reused next time.',
+        widget='Dropdown',
+        choices=['yes', 'no'],
+        default='yes' if confirm_matches else 'no',
+        action='store'
+    )
+    parser.add_argument(
+        '--restart_steam',
+        metavar='Restart Steam automatically',
+        help='Quit Steam before writing shortcuts, then start it again so the library reloads. Defaults to no.',
+        widget='Dropdown',
+        choices=['yes', 'no'],
+        default='yes' if restart_steam else 'no',
+        action='store'
+    )
+
     return parser.parse_args()
 
 
 def storeVariablesFromGUI(args):
-    global game_installation_path, steamgriddb_api_key, steamdir_path, steam_user_id
+    global game_installation_path, steamgriddb_api_key, steamdir_path, steam_user_id, scan_xbox, xbox_games_path, confirm_matches, restart_steam, xbox_collection, grid_overrides, xbox_collection_appids
 
-    game_installation_path = args.game_installation_path
+    game_installation_path = args.game_installation_path or ""
     steamgriddb_api_key = args.steamgriddb_api_key
     steamdir_path = args.steamdir_path
     steam_user_id = resolve_steam_user_id(args.steam_user_id) or args.steam_user_id
+    scan_xbox = coerce_bool(getattr(args, "scan_xbox", True), True)
+    xbox_games_path = getattr(args, "xbox_games_path", "") or ""
+    confirm_matches = coerce_bool(getattr(args, "confirm_matches", True), True)
+    restart_steam = coerce_bool(getattr(args, "restart_steam", False), False)
+    xbox_collection = coerce_bool(getattr(args, "xbox_collection", True), True)
 
-    storedParametersJSON = {}
+    storedParametersJSON = readJsonFile(storedParametersJSONFilename) or {}
     storedParametersJSON["game_installation_path"] = game_installation_path
     storedParametersJSON["steamgriddb_api_key"] = steamgriddb_api_key
     storedParametersJSON["steamdir_path"] = steamdir_path
     storedParametersJSON["steam_user_id"] = steam_user_id
+    storedParametersJSON["scan_xbox"] = scan_xbox
+    storedParametersJSON["xbox_games_path"] = xbox_games_path
+    storedParametersJSON["confirm_matches"] = confirm_matches
+    storedParametersJSON["restart_steam"] = restart_steam
+    storedParametersJSON["xbox_collection"] = xbox_collection
+    storedParametersJSON["grid_overrides"] = storedParametersJSON.get("grid_overrides", grid_overrides) or {}
+    storedParametersJSON["xbox_collection_appids"] = storedParametersJSON.get("xbox_collection_appids", xbox_collection_appids) or []
+    grid_overrides = storedParametersJSON["grid_overrides"]
+    xbox_collection_appids = storedParametersJSON["xbox_collection_appids"]
 
     saveJsonFile(storedParametersJSONFilename, storedParametersJSON)
 
@@ -622,8 +1029,12 @@ def main(args):
     try:
         storeVariablesFromGUI(args)
 
-        if not game_installation_path or not steamgriddb_api_key or not steamdir_path:
+        if not steamgriddb_api_key or not steamdir_path:
             logger.error("Some required parameters are missing.")
+            return 1
+
+        if not scan_xbox and not game_installation_path:
+            logger.error("Provide a Non-Steam games folder or enable Xbox Game Pass scanning.")
             return 1
 
         if steamgriddb_api_key == "https://www.steamgriddb.com/profile/preferences/api":
@@ -634,16 +1045,37 @@ def main(args):
             logger.error("Custom Steam path was saved. Please restart the application to load the Steam users dropdown.")
             return 1
 
+        if restart_steam and is_steam_running():
+            logger.info("Restart Steam is enabled. Shutting Steam down before writing shortcuts...")
+            if not stop_steam():
+                logger.error("Could not shut down Steam. Aborting so shortcuts.vdf is not overwritten.")
+                return 1
+        elif not restart_steam:
+            warn_if_steam_running()
+
         logger.info("Reading current games from installation directory...")
         current_games = read_current_games()
 
         nl = '\n'
-        logger.info(f"Current games: {nl.join(str(current_games).split(','))}")
+        game_summaries = [f"{entry.search_name} [{entry.source}] {entry.start_dir}" for entry in current_games]
+        logger.info(f"Current games:{nl}{nl.join(game_summaries) if game_summaries else '(none)'}")
 
         steam_user_data_path = determineUserdataFolder(args.steam_user_id)
 
         logger.info("Updating shortcuts and fetching images...")
-        update_shortcuts(current_games, steam_user_data_path)
+        xbox_appids = update_shortcuts(current_games, steam_user_data_path) or []
+
+        if xbox_collection:
+            try:
+                managed = write_xbox_collection(steam_user_data_path, xbox_appids, xbox_collection_appids)
+                save_xbox_collection_appids(managed)
+                logger.info(f"Updated Steam collection '{XBOX_TAG}' with {len(xbox_appids)} game(s).")
+            except Exception:
+                logger.error("Failed to update the Xbox Game Pass collection.")
+                logger.error(traceback.format_exc())
+
+        if restart_steam:
+            start_steam()
         return 0
 
     except Exception as e:
@@ -652,10 +1084,49 @@ def main(args):
         return 1
 
 
+def rewrite_cli_xbox_flags(argv: list[str]) -> list[str]:
+    rewritten = []
+    for arg in argv:
+        if arg == "--scan-xbox":
+            rewritten.extend(["--scan_xbox", "yes"])
+        elif arg == "--no-scan-xbox":
+            rewritten.extend(["--scan_xbox", "no"])
+        elif arg.startswith("--scan-xbox="):
+            rewritten.extend(["--scan_xbox", arg.split("=", 1)[1]])
+        elif arg == "--confirm-matches":
+            rewritten.extend(["--confirm_matches", "yes"])
+        elif arg == "--no-confirm-matches":
+            rewritten.extend(["--confirm_matches", "no"])
+        elif arg.startswith("--confirm-matches="):
+            rewritten.extend(["--confirm_matches", arg.split("=", 1)[1]])
+        elif arg == "--restart-steam":
+            rewritten.extend(["--restart_steam", "yes"])
+        elif arg == "--no-restart-steam":
+            rewritten.extend(["--restart_steam", "no"])
+        elif arg.startswith("--restart-steam="):
+            rewritten.extend(["--restart_steam", arg.split("=", 1)[1]])
+        elif arg == "--xbox-collection":
+            rewritten.extend(["--xbox_collection", "yes"])
+        elif arg == "--no-xbox-collection":
+            rewritten.extend(["--xbox_collection", "no"])
+        elif arg.startswith("--xbox-collection="):
+            rewritten.extend(["--xbox_collection", arg.split("=", 1)[1]])
+        else:
+            rewritten.append(arg)
+    return rewritten
+
+
 def run():
+    global review_uses_gui
+    sys.argv = rewrite_cli_xbox_flags(sys.argv)
+
     if '--cli' in sys.argv:
-        if not game_installation_path or not steamgriddb_api_key or not steamdir_path:
+        review_uses_gui = False
+        if not steamgriddb_api_key or not steamdir_path:
             logger.error("Missing required parameters. Please run with GUI first to set them up.")
+            return 1
+        if not scan_xbox and not game_installation_path:
+            logger.error("Provide a Non-Steam games folder or enable Xbox Game Pass scanning.")
             return 1
 
         # strip it so argparse doesn't complain
@@ -664,6 +1135,7 @@ def run():
 
     elif '--ignore-gooey' in sys.argv:
         # Gooey uses this when launching the script from the GUI.
+        review_uses_gui = True
         sys.argv.remove('--ignore-gooey')
         args = GUI(allow_raw_steam_user_id=True)
 
@@ -672,6 +1144,7 @@ def run():
         args = Gooey(
             show_preview_warning=False,
             encoding="utf-8",
+            program_name="SyncNon-SteamGamesPlus",
             progress_regex=r"Games processed: (?P<current>\d+)/(?P<total>\d+)$",
             progress_expr="current / total * 100"
         )(GUI)()
